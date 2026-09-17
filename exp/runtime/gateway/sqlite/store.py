@@ -30,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     ProjectTarget,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.interfaces import GatewayClock
@@ -47,7 +48,6 @@ from exp.runtime.gateway.sqlite.provider_authority import (
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 from exp.runtime.gateway.sqlite.setup_authority import (
     configure_direct_alias_with_identity,
-    upsert_provider_connections_and_activate_direct_alias,
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
@@ -506,36 +506,6 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 store_error=GatewayStoreError,
             )
 
-    def upsert_provider_connections_and_activate_direct_alias(
-        self,
-        *,
-        organization_id: str,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: Sha256,
-        provider_connections: tuple[ProviderConnectionMutation, ...],
-        replace: bool,
-        refusal_failover: bool = False,
-    ) -> None:
-        """Atomically revise providers, register a snapshot, and activate one direct alias."""
-        upsert_provider_connections_and_activate_direct_alias(
-            self,
-            organization_id=organization_id,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            provider_connections=provider_connections,
-            replace=replace,
-            refusal_failover=refusal_failover,
-            activate_alias_revision=activate_alias_revision_in_transaction,
-        )
-
     def configure_direct_alias_with_identity(
         self,
         *,
@@ -708,10 +678,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 catalog_sha256=str(row["catalog_sha256"]),
             )
         match request:
-            case EmbeddingsRequest() | ImagesRequest():
-                # Keyed replay is deferred for the embeddings and images
-                # surfaces: they carry no idempotency key and never claim a
-                # caller-operation scope.
+            case EmbeddingsRequest() | ImagesRequest() | DecisionRequest():
+                # These native surfaces carry no idempotency key and never
+                # claim a caller-operation scope.
                 caller_operation = None
             case GatewayRequest():
                 caller_operation = _caller_operation_sha256(request)

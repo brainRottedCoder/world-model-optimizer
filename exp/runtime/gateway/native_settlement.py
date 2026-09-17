@@ -15,6 +15,7 @@ from typing import cast
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -165,11 +166,14 @@ def ledger_failure(failure: GatewayFailure) -> GatewayFailure:
 
 def terminal_from_settlement(
     data: JsonObject,
+    *,
+    surface: GatewayApiSurface | None = None,
 ) -> tuple[GatewayEvent, GatewayFailure | None]:
     """Build a durable terminal event from one native settlement payload.
 
     Args:
         data: Parsed outcome, usage, tool names, and optional failure.
+        surface: Frozen request surface for internal decision rejection evidence.
 
     Returns:
         The normalized terminal event and optional failure.
@@ -217,8 +221,15 @@ def terminal_from_settlement(
     terminal = GatewayEvent(
         kind=kind,
         sequence_number=0,
-        usage=usage,
+        usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
+        decision_provider_rejected=(
+            surface is GatewayApiSurface.DECISIONS
+            and kind is GatewayEventKind.FAILED
+            and usage is None
+            and data.get("opened") is False
+            and data.get("decision_provider_rejected") is True
+        ),
     )
     return terminal, failure
 
@@ -243,6 +254,42 @@ def first_token_at_from_settlement(data: JsonObject) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> GatewayUsage | None:
+    """Drop a finished attempt's all-zero token report: it is not an observation.
+
+    A provider that finished serving a request processed at least its prompt,
+    so a usage object reporting zero input AND zero output tokens on a
+    completed or incomplete terminal cannot be what the provider metered.
+    Production 2026-09-15: 2.2% of the OpenAI lane's ``max_output_tokens``
+    truncations (1,634 attempts across 192 organizations in 30 days) arrived
+    with every count zero, while the identical prompt at the identical budget
+    reported ~56k input / 64 reasoning tokens the other 98% of the time, at
+    the same latency. Filing such a report as observed settles the attempt as
+    provider-confirmed free; filing it as UNKNOWN (no usage) keeps it inside
+    the ledger's unknown-usage review counters and its nightly invariant, and
+    keeps the zero out of the cache-fraction calibration. Failed terminals are
+    left alone: their zeros already settle at nothing and a billed refusal
+    keys on positive counts. The whole usage goes, tool names included: the
+    control plane files ANY non-null usage as observed (a tool-only usage is
+    its convention for a provider that omitted the meter but streamed calls),
+    and a tool call is output the meter should have counted, so tool names on
+    an all-zero report describe a stream whose meter is not credible; losing
+    ``tools_used`` on that row beats filing it as observed.
+
+    Args:
+        kind: The normalized terminal kind of the settlement.
+        usage: The usage the data plane reported, if any.
+
+    Returns:
+        The usage the ledger should record.
+    """
+    if usage is None or kind not in {GatewayEventKind.COMPLETED, GatewayEventKind.INCOMPLETE}:
+        return usage
+    if usage.input_tokens != 0 or usage.output_tokens != 0:
+        return usage
+    return None
 
 
 def _usage_from_payload(

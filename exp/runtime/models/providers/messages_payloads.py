@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema,
     anthropic_rejects_forced_tool_choice,
@@ -31,6 +32,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
+    fold_tool_result_images,
     retained_cache_marked_blocks,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -122,6 +124,10 @@ def anthropic_messages_stream_payload(
             existing.extend(blocks)
         else:
             messages.append({"role": role, "content": blocks})
+    if request.json_object_output:
+        # Anthropic has no schema-free JSON mode, so the caller's intent rides
+        # the system prompt as a trailing instruction.
+        system_parts.append((JSON_OBJECT_SYSTEM_INSTRUCTION, ()))
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
@@ -437,10 +443,15 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
+    # Gemini's functionResponse carries JSON text; a tool screenshot rides a
+    # following user content (one content per message, no role alternation
+    # rule on this wire). The native ``functionResponse.parts`` carrier is
+    # documented for the Gemini 3 series only and is not adopted unprobed.
+    folded = request.model_copy(update={"messages": fold_tool_result_images(request.messages)})
     try:
         return gemini_generate_request(
             model_id,
-            gateway_model_request(request),
+            gateway_model_request(folded),
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -451,6 +462,7 @@ def gemini_generate_content_stream_payload(
             response_json_schema=(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
+            json_object_output=request.json_object_output,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise
@@ -510,6 +522,9 @@ def bedrock_converse_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
+            json_object_instruction=(
+                JSON_OBJECT_SYSTEM_INSTRUCTION if request.json_object_output else None
+            ),
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise

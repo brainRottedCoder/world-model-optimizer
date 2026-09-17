@@ -38,9 +38,9 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
+    THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
     THROTTLE_SURFACED_CACHE_PRESERVING,
-    DeadRung,
     InflightRequest,
     ThrottleDisposition,
     claim_route_from,
@@ -49,7 +49,12 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
     rung_load_key,
 )
-from exp.runtime.gateway.native_rung_policy import failed_dispatch_candidate, reserve_rung_slot
+from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
+from exp.runtime.gateway.native_rung_policy import (
+    failed_dispatch_candidate,
+    reserve_rung_slot,
+    shed_keeps_rung,
+)
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
     all_routes_unavailable_failure,
@@ -155,17 +160,10 @@ class NativeAttemptAccounting:
         self._write_ledger = write_ledger
         self._budget_error_factory = budget_error_factory
         self._cache_sample_gate = cache_sample_gate
-        # The native waterfall's deployment-health circuits, revision-scoped
-        # to the traffic this plane serves.
+        # Revision-scoped deployment health; physical-lane load survives catalog rolls.
         self._health = DeploymentHealthRegistry()
-        # Per-worker in-flight counters and rate windows for rungs that author
-        # a dispatch policy (concurrency bound, rate caps, weighted fair
-        # share); pure in-memory arithmetic, physical-lane scoped so counters
-        # survive catalog rolls.
         self._loads = RungLoadRegistry()
-        # Worker-local conversation-to-rung bindings under
-        # maximize_cache_affinity, so a spilled conversation keeps serving off
-        # the rung holding its warm cache instead of bouncing back.
+        # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
@@ -187,11 +185,14 @@ class NativeAttemptAccounting:
         self._rung_rate_limit_sheds = 0
         self._rung_fresh_session_spills = 0
         # Cache-stakes throttle dispositions on pools authoring a
-        # throttle_cache_threshold: throttles surfaced (warm cache met the
-        # threshold; no further attempt row, so this is the only worker-side
-        # trace) and throttles that actually failed over cold (fallback reserved).
+        # throttle_cache_threshold (surfaced: no further attempt row, so the
+        # only worker-side trace; failed over cold: fallback reserved), plus
+        # post-backoff redials on pools authoring a throttle_redial schedule
+        # and the redials force-admitted past the warm rung's own rate shed.
         self._throttles_surfaced = 0
         self._throttles_failed_over = 0
+        self._throttle_backoff_redials = 0
+        self._throttle_backoff_forced = 0
         # The sweep also runs on a timer so retained settlements and abandoned
         # attempts are recovered even when no further requests arrive.
         self._sweeper = threading.Thread(
@@ -270,22 +271,25 @@ class NativeAttemptAccounting:
         with self._lock:
             return (self._rung_rate_limit_sheds, self._rung_fresh_session_spills)
 
-    def throttle_cache_counters(self) -> tuple[int, int]:
-        """Return ``(throttles_surfaced, throttles_failed_over)`` for metrics."""
+    def throttle_cache_counters(self) -> tuple[int, int, int, int]:
+        """Return ``(surfaced, failed_over, backoff_redials, backoff_forced)`` for metrics."""
         with self._lock:
-            return (self._throttles_surfaced, self._throttles_failed_over)
+            return (
+                self._throttles_surfaced,
+                self._throttles_failed_over,
+                self._throttle_backoff_redials,
+                self._throttle_backoff_forced,
+            )
 
     def _count_throttle_disposition(self, disposition: ThrottleDisposition) -> None:
-        """Count one cache-stakes throttle decision for the metrics snapshot."""
+        """Count one throttle decision for the metrics snapshot."""
         with self._lock:
             if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
                 self._throttles_surfaced += 1
+            elif disposition == THROTTLE_BACKOFF:
+                self._throttle_backoff_redials += 1
             else:
                 self._throttles_failed_over += 1
-
-    def mark_unhealthy(self) -> None:
-        """Latch an unhealthy state after a lost terminal accounting write."""
-        self._accounting_healthy = False
 
     def counters(self) -> tuple[int, int, int]:
         """Return sweep recoveries and registry size for the metrics snapshot."""
@@ -352,9 +356,11 @@ class NativeAttemptAccounting:
             argument: JSON object with ``request_id``, ``attempt_ordinal``
                 (the count of physical dispatches already reserved), optional
                 ``current_depth`` (the route position of the failed dispatch,
-                absent for the first), and the optional classified
-                ``failure`` with its ``retryable_same_deployment`` and
-                ``failover_eligible`` flags.
+                absent for the first), the optional classified ``failure``
+                with its ``retryable_same_deployment`` and
+                ``failover_eligible`` flags, and optional ``throttle_backoff``
+                (true when the data plane waited the pool's ``throttle_redial``
+                backoff and asks to redial the throttled rung).
 
         Returns:
             ``{"attempt_id", "route_depth"}`` for one durably reserved
@@ -389,14 +395,14 @@ class NativeAttemptAccounting:
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
+        ladder = eligible_ladder(route, failure)  # The depths this walk may claim at all.
         # Rung dispatch policies shed a claimed rung SIDEWAYS to the next
-        # claimable one instead of queueing on it (spill in seconds, never a
-        # deadline death). Each shed is remembered so the dispatched attempt
-        # can disclose the bypassed preferred rung, and so a ladder exhausted
-        # ONLY by policy sheds can force-admit past the bound rather than
-        # manufacture a failure unbounded admission would not have had.
+        # claimable one instead of queueing on it. Each shed is remembered so
+        # the dispatched attempt can disclose the bypassed rung, and so a ladder
+        # exhausted ONLY by sheds can force-admit past the bound, never fail.
         policy_sheds: list[tuple[int, str]] = []
         disposition: ThrottleDisposition | None = None
+        redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -405,8 +411,11 @@ class NativeAttemptAccounting:
                 entry=entry,
                 failure=failure,
                 current_depth=current_depth,
+                throttle_backoff=data.get("throttle_backoff") is True,
             )
-            if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
+            if disposition == THROTTLE_BACKOFF:
+                redial_depth = current_depth
+            elif disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
                 # Terminal by construction, so counted at the decision; the
                 # cold branch counts only once a fallback is reserved below.
                 self._count_throttle_disposition(disposition)
@@ -417,7 +426,7 @@ class NativeAttemptAccounting:
                 policy_sheds.append((current_depth, THROTTLE_FAILOVER_COLD))
             last_failure: GatewayFailure | None = failure
         else:
-            candidate = claim_route_from(self._health, keys, 0)
+            candidate = claim_route_from(self._health, keys, 0, ladder)
             last_failure = None
         forced_overflow = False
         # The input half of the reservation tokenizes the whole prompt, so it
@@ -453,14 +462,20 @@ class NativeAttemptAccounting:
             if isinstance(ticket, RungShed):
                 policy_sheds.append((candidate, ticket.reason))
                 self._health.release_probe(keys[candidate])
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                forced_overflow = shed_keeps_rung(
+                    route, candidate, redial_depth, last_failure, ticket.reason
+                )
+                if not forced_overflow:
+                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
+            throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
                 route,
                 candidate,
                 policy_sheds=policy_sheds,
                 forced_overflow=forced_overflow,
                 sticky_preferred=entry.sticky_preferred,
+                throttle_backoff=throttle_backoff,
             )
             try:
                 attempt_id = self._write_ledger.start_attempt(
@@ -473,8 +488,8 @@ class NativeAttemptAccounting:
                     ),
                     reserved_input_tokens=reserved_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
-                    route_reason=route.route_reason,
-                    fallback_reason=route.fallback_reason,
+                    route_reason=route.attempt_route_reason(route.deployments[candidate]),
+                    fallback_reason=rule_fallback_reason(route, candidate, current_depth, failure),
                     dispatch_reason=dispatch_reason,
                     preferred_deployment=preferred_deployment,
                 )
@@ -499,7 +514,10 @@ class NativeAttemptAccounting:
                     if candidate == len(route.deployments) - 1
                     else all_routes_unavailable_failure()
                 )
-                candidate = claim_route_from(self._health, keys, candidate + 1)
+                if candidate == redial_depth:
+                    # The forced admission belonged to the redialed rung alone.
+                    forced_overflow = False
+                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -523,16 +541,20 @@ class NativeAttemptAccounting:
                 raise error from exc
             if ticket is not None:
                 self._loads.bind(ticket, attempt_id)
-            if forced_overflow:
-                with self._lock:
-                    self._rung_saturated_overflows += 1
             if disposition == THROTTLE_FAILOVER_COLD:
-                # Real only now: a cold decision whose ladder then exhausts
-                # ends as a plain exhausted throttle, counted as neither.
+                # Real only now: an exhausted ladder is a plain exhausted throttle.
                 self._count_throttle_disposition(disposition)
+            elif throttle_backoff:
+                self._count_throttle_disposition(THROTTLE_BACKOFF)
             self._bind_sticky_dispatch(entry, deployment)
             with self._lock:
+                if forced_overflow and not throttle_backoff:
+                    self._rung_saturated_overflows += 1
+                elif forced_overflow:
+                    self._throttle_backoff_forced += 1
                 entry.attempt_counts[candidate] += 1
+                if throttle_backoff:
+                    entry.throttle_redials[candidate] += 1
                 entry.total_attempts += 1
                 entry.active_attempt_id = attempt_id
                 entry.attempt_depths[attempt_id] = candidate
@@ -641,7 +663,7 @@ class NativeAttemptAccounting:
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
-        terminal, failure = terminal_from_settlement(data)
+        terminal, failure = terminal_from_settlement(data, surface=entry.authorization.surface)
         first_token_at = first_token_at_from_settlement(data)
         rate_limit = settlement_rate_limit(data)
         try:
@@ -876,7 +898,9 @@ class NativeAttemptAccounting:
             settlement = entry.pending_settlement
             if settlement is None:
                 continue
-            terminal, failure = terminal_from_settlement(settlement)
+            terminal, failure = terminal_from_settlement(
+                settlement, surface=entry.authorization.surface
+            )
             if self._settle_swept(
                 request_id,
                 entry,
@@ -966,31 +990,3 @@ class NativeAttemptAccounting:
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
         return True
-
-
-def record_dead_admission_rungs(
-    accounting: NativeAttemptAccounting,
-    authorization: AuthorizationSnapshot,
-    dead: tuple[DeadRung, ...],
-    *,
-    fallback_available: bool,
-) -> None:
-    """Record admission-dead rungs and surface a lead masked by fallback."""
-    if not dead:
-        return
-    for rung in dead:
-        accounting.health.failed(
-            deployment_health_key(authorization, rung.deployment),
-            rung.failure,
-        )
-    lead = next((rung for rung in dead if rung.index == 0), None)
-    lead_masked = lead is not None and fallback_available
-    accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
-    if lead is not None and fallback_available:
-        _logger.warning(
-            "gateway admission skipped the lead rung for alias %r: served off a "
-            "fallback because deployment %r (provider %r) was dead at admission",
-            authorization.alias,
-            lead.deployment.deployment_id,
-            lead.deployment.provider,
-        )

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -19,11 +20,14 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
+    THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
     THROTTLE_SURFACED_CACHE_PRESERVING,
     claim_route_from,
     deployment_wire_entry,
+    dispatch_disclosure,
     next_route_candidate,
+    reorder_route_deployments,
     select_route_deployments,
     throttle_disposition,
 )
@@ -97,6 +101,31 @@ def _failover_only() -> GatewayFailure:
         safe_message="provider throttled the request",
         failover_eligible=True,
     )
+
+
+def test_route_narrowing_and_reordering_keep_the_reasoning_pin() -> None:
+    """A narrowed or reordered pinned route still knows which rung sealed the reasoning.
+
+    The pin survives dead-rung narrowing and affinity reordering so every
+    surviving non-issuing rung still requires the strip and is still recorded
+    as ``reasoning_continuation_failover``, even when narrowing removed the
+    issuing rung itself.
+    """
+    pinned = _route().model_copy(
+        update={
+            "route_reason": "reasoning_continuation",
+            "reasoning_pinned_deployment_id": "one",
+        }
+    )
+    narrowed = select_route_deployments(pinned, (1, 2))
+    assert narrowed.reasoning_pinned_deployment_id == "one"
+    assert all(narrowed.requires_reasoning_strip(item) for item in narrowed.deployments)
+    assert narrowed.attempt_route_reason(narrowed.deployment) == "reasoning_continuation_failover"
+    reordered = reorder_route_deployments(pinned, (2, 0, 1))
+    assert reordered.reasoning_pinned_deployment_id == "one"
+    assert reordered.requires_reasoning_strip(reordered.deployment) is True
+    assert reordered.requires_reasoning_strip(reordered.deployments[1]) is False
+    assert reordered.attempt_route_reason(reordered.deployments[1]) == "reasoning_continuation"
 
 
 def test_select_route_deployments_rebinds_the_execution_snapshot() -> None:
@@ -650,6 +679,28 @@ def test_wire_entry_carries_emulated_stop_sequences_for_the_data_plane() -> None
     assert default["stop_sequences"] == []
 
 
+def test_wire_entry_carries_the_rungs_failover_only_on_tokens() -> None:
+    """A failover-only rung's entry lists its tokens; an unrestricted rung carries null."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, profile, {})["failover_only_on"] is None
+    restricted = route.deployment.model_copy(
+        update={
+            "gateway": route.deployment.gateway.model_copy(
+                update={
+                    "capabilities": route.deployment.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("refusal:cyber_policy", "throttled")}
+                    )
+                }
+            )
+        }
+    )
+    assert deployment_wire_entry(route, restricted, profile, {})["failover_only_on"] == [
+        "refusal:cyber_policy",
+        "throttled",
+    ]
+
+
 def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     """A BYOK rung's entry says so, so the data plane re-owns credential failures."""
     route = _route()
@@ -865,3 +916,158 @@ def test_wire_entry_carries_the_tool_call_serialization_flag() -> None:
         "serialize_tool_calls"
     ]
     assert not deployment_wire_entry(route, route.deployment, profile, {})["serialize_tool_calls"]
+
+
+_REDIAL = GatewayThrottleRedialPolicy(max_attempts=2, base_delay_ms=100, max_delay_ms=2_000)
+
+
+def test_throttle_redial_redials_the_warm_rung_through_its_window_until_the_cap() -> None:
+    """A post-backoff redial claims the throttled rung; the spent cap advances cold.
+
+    The settle already recorded the rung's throttle window, so a plain claim
+    refuses it; the data plane's ``throttle_backoff`` reservation is the one
+    request deliberately probing the rung back. Once the per-rung redials are
+    spent the throttle advances like any failover-eligible failure, even under
+    ``maximize_cache``, whose surfacing rule the schedule replaces.
+    """
+    health = DeploymentHealthRegistry(throttle_seconds=30.0)
+    health.failed(_KEYS[0], _failover_only())
+    assert not health.claim(_KEYS[0])
+
+    def candidate(
+        counts: list[int],
+        redials: int,
+        *,
+        backoff: bool,
+        keys: tuple[DeploymentHealthKey, ...] = _KEYS,
+    ) -> int | None:
+        """Ask the frozen policy after ``counts`` dispatches and ``redials`` backoffs."""
+        return next_route_candidate(
+            health=health,
+            keys=keys,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=counts,
+            total_attempts=sum(counts),
+            refusal_failover=False,
+            failover_mode="maximize_cache",
+            throttle_redial=_REDIAL,
+            throttle_backoff=backoff,
+            throttle_redial_budget=_REDIAL.max_attempts - redials,
+        )
+
+    # Two redials of the warm rung after its throttled dispatch...
+    assert candidate([1, 0], 0, backoff=True) == 0
+    assert candidate([2, 0], 1, backoff=True) == 0
+    # ...then the budget is spent and the ladder advances cold (no surfacing).
+    assert candidate([3, 0], 2, backoff=True) == 1
+    # A retryable-class redial of the same rung spends no throttle budget:
+    # three dispatches there but only one post-backoff redial still redials.
+    assert candidate([3, 0], 1, backoff=True) == 0
+    # A throttle the data plane did not wait out advances at once.
+    assert candidate([1, 0], 0, backoff=False) == 1
+    # A single-rung ladder past its redials is exhausted, and only then.
+    assert candidate([3], 2, backoff=True, keys=_KEYS[:1]) is None
+    # The hard total cap still bounds the whole story.
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_failover_only(),
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=8,
+            refusal_failover=False,
+            throttle_redial=_REDIAL,
+            throttle_backoff=True,
+        )
+        is None
+    )
+
+
+def test_throttle_redial_replaces_the_threshold_surfacing_rule_and_leaves_other_classes() -> None:
+    """Warm cache above the threshold now backs off or advances; it never surfaces."""
+    health = DeploymentHealthRegistry()
+
+    def candidate(
+        failure: GatewayFailure,
+        *,
+        throttle_redial: GatewayThrottleRedialPolicy | None = None,
+        throttle_backoff: bool = False,
+    ) -> int | None:
+        """Ask the frozen policy with warm cache (0.9) above an authored 0.5 threshold."""
+        return next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=failure,
+            current_depth=0,
+            attempt_counts=[1, 0],
+            total_attempts=1,
+            refusal_failover=False,
+            throttle_cache_threshold=0.5,
+            cached_fraction=0.9,
+            throttle_redial=throttle_redial,
+            throttle_backoff=throttle_backoff,
+            throttle_redial_budget=_REDIAL.max_attempts,
+        )
+
+    # Without a schedule the met threshold surfaces the throttle.
+    assert candidate(_failover_only()) is None
+    # With one, the same cache means "wait here" (redial) or advance cold.
+    assert candidate(_failover_only(), throttle_redial=_REDIAL, throttle_backoff=True) == 0
+    assert candidate(_failover_only(), throttle_redial=_REDIAL) == 1
+    # Other classes keep their own rules: a retryable failure redials on its
+    # own flag, a client error never advances, backoff flag or not.
+    assert candidate(_retryable(), throttle_redial=_REDIAL, throttle_backoff=True) == 0
+    invalid = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST, safe_message="bad request"
+    )
+    assert candidate(invalid, throttle_redial=_REDIAL, throttle_backoff=True) is None
+
+
+def test_dispatch_disclosure_names_a_backoff_redial_on_every_pool() -> None:
+    """The redial is ``throttle_backoff`` with no counterfactual, affinity pools included."""
+    route = _route()
+    assert dispatch_disclosure(
+        route, 0, policy_sheds=[], forced_overflow=False, throttle_backoff=True
+    ) == (THROTTLE_BACKOFF, None)
+    affinity = route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={"failover_mode": "maximize_cache_affinity"}
+            )
+        }
+    )
+    assert dispatch_disclosure(
+        affinity, 0, policy_sheds=[], forced_overflow=False, throttle_backoff=True
+    ) == (THROTTLE_BACKOFF, None)
+    assert dispatch_disclosure(affinity, 0, policy_sheds=[], forced_overflow=False) == (
+        "affinity",
+        None,
+    )
+    # A redial the rung's own policy shed and the accounting force-admitted
+    # stays throttle_backoff: neither the shed reason nor saturated_overflow
+    # may relabel the attempt the caller waited the backoff for.
+    for pool in (route, affinity):
+        assert dispatch_disclosure(
+            pool,
+            0,
+            policy_sheds=[(0, "rate_limit")],
+            forced_overflow=True,
+            throttle_backoff=True,
+        ) == (THROTTLE_BACKOFF, None)
+
+
+def test_wire_entry_carries_the_throttle_redial_budget() -> None:
+    """The admission-time redial budget rides the wire entry; unauthored rungs carry zero."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_responses", url="https://provider.test")
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {})["throttle_redial_budget"] == 0
+    )
+    assert (
+        deployment_wire_entry(route, route.deployment, profile, {}, throttle_redial_budget=3)[
+            "throttle_redial_budget"
+        ]
+        == 3
+    )

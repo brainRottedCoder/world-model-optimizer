@@ -20,6 +20,7 @@ from exp.common.models import (
     ModelRecord,
     ModelRoles,
     ModelSnapshot,
+    ReasoningEffort,
     SFTModelProvenance,
     load_model_catalog,
     write_model_catalog,
@@ -355,6 +356,42 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
         "max",
     )
     assert "input_nano_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "values",
+    (("high", "low"), ("high", "high")),
+)
+def test_gateway_reasoning_efforts_require_unique_canonical_order(
+    values: tuple[ReasoningEffort, ...],
+) -> None:
+    """Ambiguous provider effort sets fail when the catalog is authored."""
+    with pytest.raises(ValueError):
+        GatewayDeploymentCapabilities(supported_reasoning_efforts=values)
+
+
+def test_required_gateway_reasoning_effort_needs_supported_values() -> None:
+    """A mandatory wire parameter cannot omit its provider value domain."""
+    with pytest.raises(ValueError, match="at least one supported reasoning effort"):
+        GatewayDeploymentCapabilities(reasoning_effort_required=True)
+
+
+def test_required_gateway_reasoning_effort_needs_an_explicit_default() -> None:
+    """A mandatory wire parameter cannot force admission to guess its value."""
+    with pytest.raises(ValueError, match="needs reasoning_default_effort"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_effort_required=True,
+        )
+
+
+def test_gateway_reasoning_default_must_be_supported() -> None:
+    """A provider default outside the exact domain fails catalog loading."""
+    with pytest.raises(ValueError, match="must be one of the supported"):
+        GatewayDeploymentCapabilities(
+            supported_reasoning_efforts=("low", "high"),
+            reasoning_default_effort="max",
+        )
 
 
 @pytest.mark.parametrize("capabilities", (None, ModelCapabilities()))
@@ -767,6 +804,36 @@ def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> Non
     assert root.identity_sha256() != with_v1_root.identity_sha256()
 
 
+def test_astra_responses_capability_slots_default_off() -> None:
+    """The three GPT-6 Astra Responses capability slots exist and default off.
+
+    These are declaration slots for async function calling, mid-turn steering,
+    and mid-conversation reasoning-effort updates. They default False (no
+    deployment advertises a behavior the decoder/turn lifecycle does not yet
+    honor) and, being defaulted, stay identity-invisible (see
+    gateway_catalog_test's identity-digest pin). The platform's
+    generation-capability vocabulary is drift-locked to these field names, so
+    they must remain present for that projection to admit the keys.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_async_tools is False
+    assert caps.supports_mid_turn_steering is False
+    assert caps.supports_reasoning_effort_update is False
+    # Defaulted addition contributes zero identity bytes.
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_minimum_output_tokens_is_a_defaulted_positive_lane_fact() -> None:
+    """The provider output floor defaults off (identity-invisible, no schema
+    bump), is declared per deployment, and must be a positive count."""
+    caps = GatewayDeploymentCapabilities()
+    assert caps.minimum_output_tokens is None
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayDeploymentCapabilities(minimum_output_tokens=16).minimum_output_tokens == 16
+    with pytest.raises(ValidationError):
+        GatewayDeploymentCapabilities(minimum_output_tokens=0)
+
+
 def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None:
     """A requested flex/priority card replaces the base schedule whole-request;
     other tiers (and no card) leave the base schedule unchanged."""
@@ -890,3 +957,35 @@ output_micro_usd_per_million_tokens = 10000000
     path.write_text(text.replace("input_nano_usd", "input_micro_usd"), encoding="utf-8")
     with pytest.raises(ModelCatalogError, match="micro-USD price key"):
         load_model_catalog(path)
+
+
+def test_schema_drift_disclosure_slots_default_off() -> None:
+    """The five schema-drift disclosure slots exist and default off.
+
+    False means the capability is not declared. Defaulted fields stay
+    identity-invisible, so the pinned catalog digest does not move.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_prompt_cache_boundaries is False
+    assert caps.supports_custom_tools is False
+    assert caps.supports_grammar_tools is False
+    assert caps.supports_tool_call_limit is False
+    assert caps.reports_model_status is False
+    assert caps.reports_reasoning_tokens is False
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_grammar_tools_require_custom_tools() -> None:
+    """Grammar-tool support cannot be declared without custom-tool support."""
+    with pytest.raises(ValueError, match="requires supports_custom_tools=true"):
+        GatewayDeploymentCapabilities(supports_grammar_tools=True)
+
+
+def test_custom_and_grammar_tools_can_be_declared_together() -> None:
+    """Grammar-tool support is accepted when custom-tool support is also declared."""
+    caps = GatewayDeploymentCapabilities(
+        supports_custom_tools=True,
+        supports_grammar_tools=True,
+    )
+    assert caps.supports_custom_tools is True
+    assert caps.supports_grammar_tools is True

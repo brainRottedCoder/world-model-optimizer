@@ -20,6 +20,7 @@ from exp.common.models.content import (
     VideoContentPart,
 )
 from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.attempt_tokens import (
     AUDIO_BYTES_PER_TOKEN,
     DOCUMENT_BYTES_PER_TOKEN,
@@ -41,8 +42,10 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import RESERVATION_ENCODING, reservation_encoder
@@ -636,6 +639,32 @@ def test_embeddings_and_image_prompts_count_their_text() -> None:
     assert 0 < worst_case_input_tokens(images) < 20
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["plain text", "你好日本語" * 100, {"nested": ["日本語", 7]}],
+    ids=["ascii", "unicode", "nested-json"],
+)
+def test_decisions_reserve_utf8_state_for_every_question(state: str | JsonObject) -> None:
+    """Decision planning retains the byte bound and counts repeated state per question."""
+    question = NoulQuestion(instructions="Is this valid?")
+    single = DecisionRequest(state=state, questions={"first": question})
+    repeated = DecisionRequest(state=state, questions={"first": question, "second": question})
+    expected = (
+        len(json.dumps(state, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        + len(
+            json.dumps(
+                question.model_dump(mode="json", exclude_none=True), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        + 1024
+    )
+    assert worst_case_input_tokens(single) == single.input_token_reservation == expected
+    assert worst_case_input_tokens(repeated) == repeated.input_token_reservation == 2 * expected
+    assert counted_input_tokens(single) == expected
+    if isinstance(state, str):
+        assert expected >= len(state.encode("utf-8")) + 1024
+
+
 def test_encoder_is_loaded_once_and_the_estimate_stays_cheap() -> None:
     """One cached BPE; a fifty-thousand-token, fifteen-tool request estimates in milliseconds.
 
@@ -668,3 +697,113 @@ def test_counted_input_tokens_is_the_estimate_before_headroom() -> None:
         == (counted * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
     )
     assert counted < worst_case_input_tokens(request)
+
+
+def _claude_code_messages_payload(*, system: bool = True, tools: bool = True) -> JsonObject:
+    """A Claude Code-shaped Messages body: system array, tool definitions, six turns."""
+    system_block = (
+        "You are Claude Code, an interactive CLI tool that helps users with software "
+        "engineering tasks. Use the instructions below and the tools available to you. "
+    ) * 40
+    messages: list[JsonObject] = []
+    for turn in range(6):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Turn {turn}: " + "explain the module layout in detail. " * 10,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now. " * 5},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{turn:03d}",
+                        "name": "Read",
+                        "input": {"file_path": "/repo/src/main.py"},
+                    },
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"toolu_{turn:03d}",
+                        "content": [{"type": "text", "text": "def main():\n    pass\n" * 20}],
+                    }
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": "Now summarize."})
+    payload: JsonObject = {"model": "coding", "max_tokens": 32_000, "messages": messages}
+    if system:
+        payload["system"] = [
+            {"type": "text", "text": system_block, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Project instructions: " + system_block[:2000]},
+        ]
+    if tools:
+        payload["tools"] = [
+            {
+                "name": f"Tool{index}",
+                "description": f"Tool {index}. " + "Reads a file from the local filesystem. " * 8,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "The absolute path"},
+                        "offset": {"type": "number", "description": "The first line to read"},
+                    },
+                    "required": ["file_path"],
+                },
+            }
+            for index in range(12)
+        ]
+    return payload
+
+
+def test_messages_estimate_counts_system_every_turn_and_the_tools() -> None:
+    """A Claude Code-shaped Messages request counts in the thousands, not tens.
+
+    The start-frame / ``count_tokens`` figure is the counted prompt of the
+    DECODED Messages request: the system array (folded into the leading
+    system turn), every user, assistant, tool_use and tool_result block, and
+    each tool definition. Dropping the system blocks or the tools lowers the
+    count by at least what they contribute, so neither can be silently
+    skipped by a later decoder change.
+    """
+    full = counted_input_tokens(decode_messages(_claude_code_messages_payload()).request)
+    assert full > 1_000, full
+    without_system = counted_input_tokens(
+        decode_messages(_claude_code_messages_payload(system=False)).request
+    )
+    without_tools = counted_input_tokens(
+        decode_messages(_claude_code_messages_payload(tools=False)).request
+    )
+    # Two system blocks totalling about 1,500 tokens (counted 1,492 on the
+    # reservation BPE); twelve tools plus the fixed tool-use preamble.
+    assert full - without_system > 1_200, (full, without_system)
+    assert full - without_tools > TOOLS_PRESENT_TOKENS + 12 * 30, (full, without_tools)
+
+
+def test_json_object_estimate_covers_the_provider_instruction() -> None:
+    """JSON mode reserves the full system instruction sent to every provider."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Give one value."),),
+    )
+    json_request = request.model_copy(update={"json_object_output": True})
+    instruction_tokens = len(reservation_encoder().encode(JSON_OBJECT_SYSTEM_INSTRUCTION))
+
+    assert counted_input_tokens(json_request) - counted_input_tokens(request) >= (
+        MESSAGE_FRAMING_TOKENS + instruction_tokens
+    )

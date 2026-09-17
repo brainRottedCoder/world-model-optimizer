@@ -30,8 +30,10 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
+from exp.common.models.catalog_roles import ModelRoles
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
-from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
+from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
@@ -45,7 +47,9 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 _VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_FIXED_ORIGIN_PROVIDERS = frozenset(
+    {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
+)
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
 AzureApiSurface = Literal["openai_deployments", "model_inference"]
@@ -223,26 +227,13 @@ class ConnectionConfig(ContractModel):
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":
-            if self.bedrock_auth_mode == "api_key":
-                if self.api_key_env is None or self.aws_access_key_id_env is not None:
-                    raise ValueError(
-                        "bedrock api_key auth requires api_key_env and forbids "
-                        "aws_access_key_id_env"
-                    )
-            elif self.bedrock_auth_mode == "access_key_pair":
-                if self.api_key_env is None or self.aws_access_key_id_env is None:
-                    raise ValueError(
-                        "bedrock access_key_pair auth requires both credential environment names"
-                    )
-            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
-                raise ValueError(
-                    "bedrock explicit access-key auth requires both api_key_env naming the "
-                    "secret access key and aws_access_key_id_env naming the access key id"
-                )
-            if self.base_url is not None:
-                raise ValueError("bedrock does not accept base_url")
-            if self.api_version is not None:
-                raise ValueError("api_version is only accepted for provider='azure'")
+            require_bedrock_connection_shape(
+                bedrock_auth_mode=self.bedrock_auth_mode,
+                api_key_env=self.api_key_env,
+                aws_access_key_id_env=self.aws_access_key_id_env,
+                base_url=self.base_url,
+                api_version=self.api_version,
+            )
             if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
                 raise ValueError("bedrock region must be an AWS region name")
         elif self.provider == "vertex":
@@ -371,6 +362,223 @@ class SFTModelProvenance(ContractModel):
     sampling_handle_sha256: Sha256
 
 
+class GatewayDeploymentCapabilities(ContractModel):
+    """Gateway protocol capabilities declared for one provider deployment.
+
+    These fields are intentionally separate from ``ModelCapabilities``. The latter participates
+    in frozen optimizer and runtime identities, while this declaration can evolve with the
+    gateway protocol without invalidating existing router artifacts.
+    """
+
+    supports_decisions: bool = False
+    """Whether this deployment serves native typed decisions instead of chat."""
+
+    supports_developer_messages: bool = False
+    supports_streaming: bool = False
+    supports_streaming_tool_arguments: bool = False
+    supports_strict_tools: bool = False
+    supports_parallel_tool_calls: bool = False
+    supports_custom_tools: bool = False
+    """Whether this deployment's relevant native wire can preserve free-form custom tools.
+
+    False means the capability is not declared. Public Chat still refuses
+    custom tools even when a Responses-native deployment declares this,
+    because Chat accepts function tools only. Read the flag with the parity
+    row's dialect and the caller's public API surface.
+    """
+    supports_grammar_tools: bool = False
+    """Whether grammar-constrained custom tools can be preserved on this deployment.
+
+    This requires ``supports_custom_tools``. False means the capability is
+    not declared; it does not describe Chat, which still refuses custom and
+    grammar tools.
+    """
+    supports_tool_call_limit: bool = False
+    """Whether a caller's Responses ``max_tool_calls`` limit can be preserved.
+
+    False means the capability is not declared. The public Responses
+    surface currently refuses the field, so no authored catalog should set
+    this until a route honors the cap.
+    """
+    supports_structured_text: bool = False
+    supports_stop_sequences: bool = False
+    supports_image_input: bool = False
+    """Whether the wire and model accept images; undeclared image input is rejected."""
+    supports_image_url_input: bool = False
+    """Whether the provider fetches remote images; undeclared URLs are rejected.
+
+    Every image-capable wire accepts inline base64; URL support varies by route.
+    """
+    supports_video_input: bool = False
+    """Whether the wire and model accept video; undeclared video input is rejected.
+
+    Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url`` wires.
+    """
+    supports_video_url_input: bool = False
+    """Whether the provider fetches video URLs (Gemini and OpenAI-compatible wires).
+
+    Bedrock requires inline bytes or an S3 location that the gateway does not author.
+    """
+    supports_audio_input: bool = False
+    """Whether the wire and model accept audio; undeclared audio input is rejected.
+
+    Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``.
+    No public audio surface accepts remote URLs.
+    """
+    supports_pdf_input: bool = False
+    """Whether the wire and model accept PDFs; undeclared document input is rejected."""
+    supports_pdf_url_input: bool = False
+    """Whether this route's provider fetches a caller PDF URL itself.
+
+    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
+    source) wires fetch a remote document; Chat Completions ``file`` parts,
+    Gemini, and Bedrock accept inline bytes only.
+    """
+    supports_prompt_cache_boundaries: bool = False
+    """Whether explicit caller-selected prompt-cache boundaries can be preserved.
+
+    This covers Chat ``prompt_cache_options`` and ``prompt_cache_retention``.
+    False means those explicit boundaries are not declared as preserved; it
+    does not mean implicit prefix caching is absent.
+    """
+    supports_media_handle_input: bool = False
+    """Whether this route forwards handles to media the caller uploaded to its provider.
+
+    A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a
+    ``gs://`` object on Vertex, an ``s3://`` object on Bedrock) is scoped to
+    the provider that minted it and never portable, so admission requires
+    both this declaration and a handle provider equal to the route's
+    provider. Providers whose inference wire defines no uploaded-media
+    reference (Fireworks, OpenRouter) never declare it.
+    """
+    maximum_stop_sequences: int | None = Field(default=None, ge=1)
+    """Largest stop-sequence count this route accepts, when the provider caps it.
+
+    ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
+    field). A concrete value lets admission reject an over-limit list locally with a
+    named parameter error instead of forwarding it and surfacing the provider's
+    opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    minimum_output_tokens: int | None = Field(default=None, ge=1)
+    """Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6 on Bedrock: 16); a
+    smaller caller ceiling is floored to it with disclosure on every surface (see the profile)."""
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
+    """Exact caller values this deployment can preserve without normalization.
+
+    An empty tuple means the gateway should use its maintained provider-family
+    contract. OpenRouter and other catalog-driven providers declare the exact
+    ordered set here because their supported values vary by model.
+    """
+    reasoning_default_effort: ReasoningEffort | None = None
+    """The depth this deployment reasons at when the caller names none.
+
+    Emitted on a wire that requires an explicit effort, and read by Messages
+    admission as the depth a budget-less ``thinking`` config (``adaptive``, or
+    Claude Code's bare ``{type: enabled}``) asks for on an effort rung, so a
+    lane's think-mode depth is set here, not in code.
+    """
+    reasoning_effort_required: bool = False
+    """Whether this deployment requires an explicit reasoning effort on its wire."""
+    reports_refusals: bool = False
+    reports_cached_input_tokens: bool = False
+    reports_reasoning_tokens: bool = False
+    reports_model_status: bool = False
+    """Whether provider model-status metadata is preserved in the normalized response.
+
+    False means the capability is not declared. Gemini ``modelStatus`` is
+    currently unpreserved, so no authored catalog should set this until the
+    response contract carries that field.
+    """
+    supports_async_tools: bool = False
+    """Whether a tool may be flagged ``async`` so the model keeps generating
+    while the caller runs it, with the result returned later on the tool call's
+    ORIGINAL ``call_id`` (GPT-6 Astra Responses). Declaration-driven and off
+    until the decoder + turn lifecycle honor it; a route that declares it must
+    not drop an async tool call. See the platform's astra_responses helpers."""
+    supports_mid_turn_steering: bool = False
+    """Whether the caller may inject additional input over the Responses
+    WebSocket WHILE the model is working, folded into a continuation that
+    preserves completed work (GPT-6 Astra). Off until the WS transport accepts
+    inbound mid-turn frames."""
+    supports_reasoning_effort_update: bool = False
+    """Whether a ``configuration_update`` input item may change reasoning effort
+    mid-conversation without invalidating the cached prompt prefix -- the
+    request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off until the
+    decoder recognizes the item (it must not hit the unknown-item reject path)
+    and applies the effort forward."""
+    time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
+    """Deployment override for the lane's flat time-to-first-byte allowance.
+
+    ``None`` uses the serving configuration's default. The effective bound on
+    the wait for a provider's response headers is this base plus the
+    input-scaled allowance below, so very large prompts are not misread as a
+    dead lane.
+    """
+    time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
+    """Deployment override for the input-scaled time-to-first-byte allowance.
+
+    Seconds added per million approximate input tokens (the request body's
+    bytes divided by four; an allowance heuristic, never a billing quantity).
+    ``None`` uses the serving configuration's default; ``0`` disables scaling
+    for this deployment.
+    """
+    failover_only_on: tuple[FailoverToken, ...] | None = None
+    """Failure tokens this rung serves as a failover for, or ``None`` for an unrestricted rung.
+
+    A rung carrying a set is never dialed first and is dialed as a successor only
+    when the failure being failed over from spells one of its tokens (see
+    ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+    records ``fallback_reason = failover_only_on:<token>``.
+    """
+
+    @property
+    def declares_reasoning_contract(self) -> bool:
+        """Whether this metadata overrides provider-family reasoning behavior."""
+        return bool(
+            self.supported_reasoning_efforts
+            or self.reasoning_default_effort is not None
+            or self.reasoning_effort_required
+        )
+
+    @model_validator(mode="after")
+    def _require_custom_tools_for_grammar(self) -> GatewayDeploymentCapabilities:
+        """Reject grammar-tool support that is not backed by custom-tool support.
+
+        Returns:
+            The validated declaration.
+
+        Raises:
+            ValueError: ``supports_grammar_tools`` is true while
+                ``supports_custom_tools`` is false.
+        """
+        if self.supports_grammar_tools and not self.supports_custom_tools:
+            raise ValueError("supports_grammar_tools requires supports_custom_tools=true")
+        return self
+
+    @model_validator(mode="after")
+    def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:
+        """Reject ambiguous or non-canonical reasoning declarations."""
+        order = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
+        indexes = tuple(order.index(effort) for effort in self.supported_reasoning_efforts)
+        if len(set(self.supported_reasoning_efforts)) != len(self.supported_reasoning_efforts):
+            raise ValueError("supported_reasoning_efforts cannot repeat values")
+        if indexes != tuple(sorted(indexes)):
+            raise ValueError("supported_reasoning_efforts must use canonical order")
+        if (
+            self.reasoning_default_effort is not None
+            and self.reasoning_default_effort not in self.supported_reasoning_efforts
+        ):
+            raise ValueError(
+                "reasoning_default_effort must be one of the supported reasoning efforts"
+            )
+        if self.reasoning_effort_required and not self.supported_reasoning_efforts:
+            raise ValueError(
+                "reasoning_effort_required needs at least one supported reasoning effort"
+            )
+        if self.reasoning_effort_required and self.reasoning_default_effort is None:
+            raise ValueError("reasoning_effort_required needs reasoning_default_effort")
+        return self
+
+
 MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS = 1_000_000_000_000
 """Upper bound on any authored rate: $1,000 per million tokens in nano-USD.
 
@@ -390,15 +598,10 @@ NanoUsdRatePerMillionTokens = Annotated[
 class GatewayLongContextTier(ContractModel):
     """Premium rates a provider applies to whole long-context requests.
 
-    Both published tier schedules this models (Gemini's ``prompts > 200k``
-    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
-    once provider-reported input tokens reach the threshold, never only the
-    tokens past it, so that is the one semantic implemented: when
-    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
-    the base rates for every dimension of the request. ``None`` means the
-    tier rate is unknown exactly as on the base schedule; it never inherits
-    the base rate, so a deployment reporting a dimension without a tier
-    price stays honestly unpriced above the threshold.
+    When ``usage.input_tokens >= input_threshold_tokens``, tier rates replace
+    base rates for every dimension of the whole request, not just excess tokens.
+    This models Gemini and Anthropic's long-context premium schedules. A ``None``
+    tier rate stays unknown; it never inherits the base rate.
     """
 
     input_threshold_tokens: int = Field(gt=0)
@@ -553,54 +756,6 @@ class ModelRecord(ContractModel):
             )
         except SecretBoundaryError as exc:
             raise ValueError("model identity must not contain credential values") from exc
-        return self
-
-
-class ModelRoles(ContractModel):
-    """Project roles that select stable aliases without revealing credentials.
-
-    Each completion role may carry its own reasoning-effort choice, so one alias can use
-    different efforts as world model, judge, or router candidate. An absent role effort means
-    the alias's catalog capability pin applies unchanged.
-    """
-
-    candidates: tuple[str, ...] = ()
-    incumbent: str | None = None
-    world_model: str | None = None
-    judge: str | None = None
-    rubric_proposer: str | None = None
-    embedder: str | None = None
-    teacher: str | None = None
-    world_model_reasoning_effort: ReasoningEffort | None = None
-    judge_reasoning_effort: ReasoningEffort | None = None
-    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
-
-    @field_validator("candidates")
-    @classmethod
-    def _require_unique_candidates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("candidate aliases must not repeat")
-        return value
-
-    @model_validator(mode="after")
-    def _require_role_bound_reasoning_efforts(self) -> ModelRoles:
-        """Require every role-specific effort to name a currently assigned role alias.
-
-        Returns:
-            The validated roles.
-
-        Raises:
-            ValueError: An effort is declared for an unassigned role or unknown candidate.
-        """
-        if self.world_model_reasoning_effort is not None and self.world_model is None:
-            raise ValueError("world_model_reasoning_effort requires an assigned world_model")
-        if self.judge_reasoning_effort is not None and self.judge is None:
-            raise ValueError("judge_reasoning_effort requires an assigned judge")
-        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
-        if unknown:
-            raise ValueError(
-                "candidate_reasoning_efforts name unassigned candidates: " + ", ".join(unknown)
-            )
         return self
 
 

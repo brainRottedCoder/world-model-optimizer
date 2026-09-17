@@ -1,8 +1,9 @@
 """Authored exact-model pools: operator equivalence evidence and per-pool failover policy.
 
 A pool names the ordered deployment aliases an operator has certified as one
-exact model, plus the two per-pool waterfall controls: the ``FailoverMode``
-literal and the cache-stakes ``throttle_cache_threshold``. Both controls are
+exact model, plus the three per-pool waterfall controls: the ``FailoverMode``
+literal, the cache-stakes ``throttle_cache_threshold``, and the
+backoff-and-redial ``throttle_redial`` schedule. Every control is
 additive-defaulted so an unauthored pool contributes zero identity bytes under
 the catalog's exclude-defaults digest.
 """
@@ -20,7 +21,7 @@ from exp.common.core.artifacts import (
     Sha256,
     assert_secret_free,
 )
-from exp.common.models.dispatch_policy import FailoverMode
+from exp.common.models.dispatch_policy import FailoverMode, GatewayThrottleRedialPolicy
 
 
 class GatewayEquivalenceCertification(ContractModel):
@@ -83,6 +84,24 @@ class GatewayPoolRecord(ContractModel):
     unknown field on read and then fails the pool's alias closed on the
     digest mismatch, so the platform authors it only once every serving
     worker runs a build that carries the field.
+    """
+    throttle_redial: GatewayThrottleRedialPolicy | None = None
+    """Backoff-and-redial schedule for a throttled rung before the ladder advances.
+
+    When authored, a throttle is re-dialed on the SAME rung with exponential
+    backoff, then fails over down the ladder, and surfaces to the caller only
+    when every rung is exhausted. How many redials a rung is worth for one
+    request is the schedule's ``max_attempts`` scaled by the cache at stake:
+    the full budget on every rung when no ``throttle_cache_threshold`` is
+    authored, otherwise the full budget where the requesting organization's
+    cached fraction meets the threshold, a proportional share below it, and
+    zero with no cache evidence (fail over at once). Under every
+    ``failover_mode`` this replaces the surfacing throttle rule: with a
+    redial schedule authored, ``maximize_cache`` and a met threshold mean
+    "back off on this rung", never "return the 429 while another rung could
+    serve". ``None`` (the default) keeps the unauthored
+    behavior byte-identical; authoring is deployment-ordered exactly like the
+    threshold.
     """
 
     @model_validator(mode="after")

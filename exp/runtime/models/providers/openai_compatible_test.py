@@ -712,3 +712,61 @@ def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> No
     # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
     assert profile.hunyuan_reasoning_route_sha256 is None
     assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_buffered_request_folds_a_trailing_system_turn_for_deepseek_only() -> None:
+    """The buffered builder applies the same DeepSeek trailing-instruction rule."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject], openai_compatible_request("DeepSeek-V4-Flash", request)["messages"]
+    )
+    assert folded == [{"role": "user", "content": "Create a ticket.\n\nReminder: be terse."}]
+    kept = cast(list[JsonObject], openai_compatible_request("fake-model", request)["messages"])
+    assert [message["role"] for message in kept] == ["user", "system"]
+
+
+def test_system_messages_leading_only_rung_threads_the_fold_to_its_wire_profile() -> None:
+    """The catalog declaration reaches the streaming profile; an undeclared rung stays off."""
+    declared = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        api_key="fake-key",
+        system_messages_leading_only=True,
+    ).gateway_wire_profile()
+    assert declared.system_messages_leading_only is True
+    undeclared = OpenAICompatibleClient(
+        model=_snapshot(), base_url="https://gateway.xplabs.ai/qwen/v1", api_key="fake-key"
+    ).gateway_wire_profile()
+    assert undeclared.system_messages_leading_only is False
+
+
+def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung() -> None:
+    """The buffered builder applies the same leading-only rule as the streaming one."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+            ModelMessage(role="user", content="Go."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject],
+        openai_compatible_request("qwen3.8-27b", request, system_messages_leading_only=True)[
+            "messages"
+        ],
+    )
+    assert folded == [
+        {"role": "system", "content": "You are precise."},
+        {"role": "user", "content": "Create a ticket.\n\nReminder: be terse."},
+        {"role": "user", "content": "Go."},
+    ]
+    kept = cast(list[JsonObject], openai_compatible_request("qwen3.8-27b", request)["messages"])
+    assert [message["role"] for message in kept] == ["system", "user", "system", "user"]

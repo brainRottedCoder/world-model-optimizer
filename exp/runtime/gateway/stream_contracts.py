@@ -101,6 +101,12 @@ class GatewayEvent(ContractModel):
     tool_call: ToolCall | None = None
     usage: GatewayUsage | None = None
     failure: GatewayFailure | None = None
+    decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
+    """Internal decision settlement evidence that an HTTP rejection preceded execution.
+
+    False leaves unmetered decision work financially unresolved. This is not
+    provider token usage and never joins serialized events or replay identity.
+    """
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:
@@ -173,6 +179,12 @@ class GatewayFailureClass(StrEnum):
     # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
     PROVIDER_QUOTA = "provider_quota"
     REFUSAL = "refusal"
+    # The provider closed the turn as complete and delivered nothing the caller
+    # can receive (an OpenAI empty assistant message; a reasoning-only turn on a
+    # rung whose reasoning the gateway strips). The model's answer to the
+    # request content, like REFUSAL: never a deployment-circuit failure, and a
+    # 400 the SDKs do not auto-retry.
+    EMPTY_COMPLETION = "empty_completion"
     MALFORMED_RESPONSE = "malformed_response"
     PROVIDER_INTERNAL = "provider_internal"
     CANCELLED = "cancelled"

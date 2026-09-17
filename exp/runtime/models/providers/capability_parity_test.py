@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
+from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.models.providers.capability_parity import (
     CAPABILITY_PARITY_SCHEMA_VERSION,
     deployment_capability_parity,

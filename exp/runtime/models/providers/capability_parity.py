@@ -15,8 +15,8 @@ from typing import Literal, cast
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
+from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.common.models.content import MEDIA_HANDLE_PROVIDERS
-from exp.common.models.gateway_capabilities import GatewayDeploymentCapabilities
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_rejects_forced_tool_choice,
