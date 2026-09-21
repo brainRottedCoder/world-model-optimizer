@@ -989,3 +989,28 @@ def test_custom_and_grammar_tools_can_be_declared_together() -> None:
     )
     assert caps.supports_custom_tools is True
     assert caps.supports_grammar_tools is True
+
+
+def test_anthropic_inference_geography_round_trip_and_identity(tmp_path: Path) -> None:
+    """Geography is durable connection identity; absent settings preserve canonical bytes."""
+    plain = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+    us = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY", inference_geo="us")
+    assert "inference_geo" not in plain.model_dump()
+    assert us.identity_sha256() != plain.identity_sha256()
+    catalog = ModelCatalog(
+        connections={"anthropic": us},
+        models={
+            "claude": ModelRecord(
+                connection="anthropic",
+                model="claude-sonnet-4-6",
+                billing_source=BillingSource.HOST_MANAGED,
+            )
+        },
+    )
+    path = tmp_path / "regional.toml"
+    write_model_catalog(path, catalog)
+    assert load_model_catalog(path) == catalog
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig(provider="openai", inference_geo="us")
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig.model_validate({"provider": "anthropic", "inference_geo": "global"})

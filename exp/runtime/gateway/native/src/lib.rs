@@ -7,6 +7,7 @@
 
 mod admission;
 mod bridge;
+mod codex_native_inversion;
 mod dialects;
 mod encode;
 mod encode_messages;
@@ -15,6 +16,7 @@ mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;
+mod first_token_bound;
 mod guardrails;
 mod memory;
 mod metrics;
@@ -40,9 +42,11 @@ mod sse;
 mod stop_sequences;
 mod stream_errors;
 mod throttle_backoff;
+mod tool_search;
 mod tool_serialization;
 mod upstream;
 mod waterfall;
+mod web_search;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -260,7 +264,7 @@ fn metrics_snapshot_json() -> String {
 fn encode_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
@@ -288,7 +292,7 @@ fn encode_responses_fixture(
 fn completed_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<String> {
@@ -525,6 +529,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .to_string(),
             },
             "tool_call_started" => events::Event::ToolCallStarted {
+                custom: object
+                    .get("custom")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 index,
                 call_id: object
                     .get("call_id")
@@ -583,6 +591,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
             "usage" => events::Event::Usage(events::Usage {
                 input_tokens: object
                     .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_1h_input_tokens: object
+                    .get("cache_creation_1h_input_tokens")
                     .and_then(serde_json::Value::as_u64),
                 cache_creation_input_tokens: object
                     .get("cache_creation_input_tokens")
